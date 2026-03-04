@@ -3,19 +3,21 @@
 Milvus Migration Verification Tool
 ====================================
 Compare data between source and target Milvus instances after migration.
+Automatically detects primary key, vector fields, and data types.
+No assumptions about data structure - works with any collection schema.
 
 Usage:
     python3 verify_migration.py \
         --source-host 10.0.1.100 --source-port 19530 \
         --target-host 10.0.2.200 --target-port 19530 \
-        --collection game_cs_knowledge
+        --collection my_collection
 
 Checks performed:
     1. Collection existence on both instances
     2. Record count consistency
     3. Schema field matching
-    4. Sample data comparison (first 10 records)
-    5. Random spot check (20 records)
+    4. Sample data comparison (10 records)
+    5. Random spot check (20 records by PK)
     6. Vector search result consistency (Top-10)
 """
 
@@ -71,11 +73,11 @@ def connect_both(source_host, source_port, target_host, target_port, user=None, 
 
 
 def find_primary_field(collection):
-    """Find the primary key field name."""
+    """Auto-detect primary key field name and dtype."""
     for f in collection.schema.fields:
         if f.is_primary:
-            return f.name
-    return "id"
+            return f.name, str(f.dtype)
+    return None, None
 
 
 def find_vector_field(collection):
@@ -84,6 +86,55 @@ def find_vector_field(collection):
         if "VECTOR" in str(f.dtype):
             return f.name
     return None
+
+
+def get_scalar_fields(collection):
+    """Get all non-vector field names."""
+    return [f.name for f in collection.schema.fields if "VECTOR" not in str(f.dtype)]
+
+
+def build_match_all_expr(pk_name, pk_dtype):
+    """Build an expression that matches all records, regardless of PK type."""
+    if "INT" in pk_dtype:
+        return f"{pk_name} >= -9223372036854775808"
+    else:
+        # VARCHAR PK
+        return f'{pk_name} != "__IMPOSSIBLE_VALUE_PLACEHOLDER__"'
+
+
+def build_pk_in_expr(pk_name, pk_dtype, pk_values):
+    """Build a 'pk IN [...]' expression that works for both INT and VARCHAR PKs."""
+    if "INT" in pk_dtype:
+        return f"{pk_name} in {pk_values}"
+    else:
+        # VARCHAR PK - values need to be quoted
+        quoted = [f'"{v}"' for v in pk_values]
+        return f"{pk_name} in [{', '.join(quoted)}]"
+
+
+def compare_rows(row_s, row_t, scalar_fields, vec_field, pk_name):
+    """Compare two rows field by field. Returns (match: bool, detail: str)."""
+    pk_val = row_s.get(pk_name, "?")
+
+    # Compare scalar fields
+    for field in scalar_fields:
+        val_s = row_s.get(field)
+        val_t = row_t.get(field)
+        if val_s != val_t:
+            return False, f"Mismatch at PK={pk_val} field='{field}': '{val_s}' vs '{val_t}'"
+
+    # Compare vector field
+    if vec_field and vec_field in row_s and vec_field in row_t:
+        vec_s = np.array(row_s[vec_field], dtype=np.float32)
+        vec_t = np.array(row_t[vec_field], dtype=np.float32)
+        norm_s = np.linalg.norm(vec_s)
+        norm_t = np.linalg.norm(vec_t)
+        if norm_s > 0 and norm_t > 0:
+            cos_sim = np.dot(vec_s, vec_t) / (norm_s * norm_t)
+            if cos_sim < 0.9999:
+                return False, f"Vector mismatch at PK={pk_val}, cosine_sim={cos_sim:.6f}"
+
+    return True, ""
 
 
 def main():
@@ -131,8 +182,14 @@ def main():
     col_s.load()
     col_t.load()
 
-    pk_field = find_primary_field(col_s)
+    # Auto-detect fields
+    pk_name, pk_dtype = find_primary_field(col_s)
     vec_field = find_vector_field(col_s)
+    scalar_fields = get_scalar_fields(col_s)
+    output_fields = [f.name for f in col_s.schema.fields]
+    match_all_expr = build_match_all_expr(pk_name, pk_dtype)
+
+    print(f"\n  Auto-detected: PK='{pk_name}' ({pk_dtype}), Vector='{vec_field}'")
 
     # ===== Check 2: Record count =====
     print("\n--- Record Count ---")
@@ -143,78 +200,90 @@ def main():
     # ===== Check 3: Schema =====
     print("\n--- Schema Comparison ---")
     schema_match = True
-    for fs, ft in zip(col_s.schema.fields, col_t.schema.fields):
-        if fs.name != ft.name or str(fs.dtype) != str(ft.dtype):
-            schema_match = False
-            break
+    schema_mismatch_detail = ""
+    if len(col_s.schema.fields) != len(col_t.schema.fields):
+        schema_match = False
+        schema_mismatch_detail = f"Field count: source={len(col_s.schema.fields)} vs target={len(col_t.schema.fields)}"
+    else:
+        for fs, ft in zip(col_s.schema.fields, col_t.schema.fields):
+            if fs.name != ft.name or str(fs.dtype) != str(ft.dtype):
+                schema_match = False
+                schema_mismatch_detail = f"'{fs.name}'({fs.dtype}) vs '{ft.name}'({ft.dtype})"
+                break
     field_names = [f.name for f in col_s.schema.fields]
-    verifier.check("Schema matches", schema_match, f"Fields: {field_names}")
+    verifier.check(
+        "Schema matches", schema_match,
+        schema_mismatch_detail or f"Fields: {field_names}"
+    )
 
     # ===== Check 4: Sample data (first 10) =====
-    print("\n--- Sample Data Comparison (first 10 records) ---")
-    output_fields = [f.name for f in col_s.schema.fields]
-    scalar_fields = [f.name for f in col_s.schema.fields if "VECTOR" not in str(f.dtype)]
-
-    sample_s = col_s.query(expr=f"{pk_field} >= 0", output_fields=output_fields, limit=10)
-    sample_t = col_t.query(expr=f"{pk_field} >= 0", output_fields=output_fields, limit=10)
-    sample_s.sort(key=lambda x: x[pk_field])
-    sample_t.sort(key=lambda x: x[pk_field])
+    print("\n--- Sample Data Comparison (10 records) ---")
+    sample_s = col_s.query(expr=match_all_expr, output_fields=output_fields, limit=10)
+    sample_t = col_t.query(expr=match_all_expr, output_fields=output_fields, limit=10)
+    sample_s.sort(key=lambda x: str(x[pk_name]))
+    sample_t.sort(key=lambda x: str(x[pk_name]))
 
     sample_match = True
     sample_detail = "All scalar fields and vectors match"
-    for rs, rt in zip(sample_s, sample_t):
-        for field in scalar_fields:
-            if rs.get(field) != rt.get(field):
+    if len(sample_s) != len(sample_t):
+        sample_match = False
+        sample_detail = f"Sample size mismatch: source={len(sample_s)} vs target={len(sample_t)}"
+    else:
+        for rs, rt in zip(sample_s, sample_t):
+            match, detail = compare_rows(rs, rt, scalar_fields, vec_field, pk_name)
+            if not match:
                 sample_match = False
-                sample_detail = f"Mismatch at {pk_field}={rs[pk_field]} field='{field}'"
+                sample_detail = detail
                 break
-        if vec_field and sample_match:
-            vec_s = np.array(rs[vec_field])
-            vec_t = np.array(rt[vec_field])
-            cos_sim = np.dot(vec_s, vec_t) / (np.linalg.norm(vec_s) * np.linalg.norm(vec_t))
-            if cos_sim < 0.9999:
-                sample_match = False
-                sample_detail = f"Vector mismatch at {pk_field}={rs[pk_field]}, cosine_sim={cos_sim:.6f}"
-        if not sample_match:
-            break
     verifier.check("Sample data matches", sample_match, sample_detail)
 
     # ===== Check 5: Random spot check =====
     print("\n--- Random Spot Check ---")
-    random.seed(42)
-    spot_count = min(args.spot_check_count, count_s)
-    spot_ids = random.sample(range(1, count_s + 1), spot_count)
-    spot_expr = f"{pk_field} in {spot_ids}"
+    # First, fetch a batch of PKs from source to pick random ones from
+    all_pks_s = col_s.query(
+        expr=match_all_expr,
+        output_fields=[pk_name],
+        limit=min(count_s, 16384),  # Get up to 16K PKs for random selection
+    )
+    pk_values = [row[pk_name] for row in all_pks_s]
 
+    spot_count = min(args.spot_check_count, len(pk_values))
+    random.seed(42)
+    sampled_pks = random.sample(pk_values, spot_count)
+
+    spot_expr = build_pk_in_expr(pk_name, pk_dtype, sampled_pks)
     spot_s = col_s.query(expr=spot_expr, output_fields=output_fields)
     spot_t = col_t.query(expr=spot_expr, output_fields=output_fields)
-    spot_s.sort(key=lambda x: x[pk_field])
-    spot_t.sort(key=lambda x: x[pk_field])
 
-    spot_match = len(spot_s) == len(spot_t)
+    # Build lookup dicts by PK for matching
+    dict_s = {str(row[pk_name]): row for row in spot_s}
+    dict_t = {str(row[pk_name]): row for row in spot_t}
+
+    spot_match = True
     spot_detail = f"Checked {spot_count} random records"
-    if spot_match:
-        for rs, rt in zip(spot_s, spot_t):
-            for field in scalar_fields:
-                if rs.get(field) != rt.get(field):
-                    spot_match = False
-                    spot_detail = f"Mismatch at {pk_field}={rs[pk_field]} field='{field}'"
-                    break
-            if vec_field and spot_match:
-                vec_s = np.array(rs[vec_field])
-                vec_t = np.array(rt[vec_field])
-                cos_sim = np.dot(vec_s, vec_t) / (np.linalg.norm(vec_s) * np.linalg.norm(vec_t))
-                if cos_sim < 0.9999:
-                    spot_match = False
-                    spot_detail = f"Vector mismatch at {pk_field}={rs[pk_field]}, cosine_sim={cos_sim:.6f}"
-            if not spot_match:
+
+    if len(spot_s) != len(spot_t):
+        spot_match = False
+        spot_detail = f"Record count mismatch: source={len(spot_s)} vs target={len(spot_t)}"
+    else:
+        for pk_str, rs in dict_s.items():
+            rt = dict_t.get(pk_str)
+            if rt is None:
+                spot_match = False
+                spot_detail = f"PK={pk_str} exists in source but missing in target"
                 break
+            match, detail = compare_rows(rs, rt, scalar_fields, vec_field, pk_name)
+            if not match:
+                spot_match = False
+                spot_detail = detail
+                break
+
     verifier.check(f"Random spot check ({spot_count} records)", spot_match, spot_detail)
 
     # ===== Check 6: Search consistency =====
     if vec_field:
         print("\n--- Search Result Consistency (Top-10) ---")
-        test_record = col_s.query(expr=f"{pk_field} >= 0", output_fields=[vec_field], limit=1)
+        test_record = col_s.query(expr=match_all_expr, output_fields=[vec_field], limit=1)
         if test_record:
             test_vec = test_record[0][vec_field]
 
@@ -234,7 +303,7 @@ def main():
             for i, (hs, ht) in enumerate(zip(res_s[0], res_t[0])):
                 if hs.id != ht.id:
                     search_match = False
-                    search_details.append(f"Rank {i+1}: source.id={hs.id} vs target.id={ht.id}")
+                    search_details.append(f"Rank {i+1}: source={hs.id} vs target={ht.id}")
                 score_diff = abs(hs.score - ht.score)
                 if score_diff > 0.001:
                     search_match = False
@@ -254,6 +323,8 @@ def main():
         verifier.results["source"] = f"{args.source_host}:{args.source_port}"
         verifier.results["target"] = f"{args.target_host}:{args.target_port}"
         verifier.results["collection"] = collection_name
+        verifier.results["primary_key"] = f"{pk_name} ({pk_dtype})"
+        verifier.results["vector_field"] = vec_field
         verifier.results["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(verifier.results, f, indent=2, ensure_ascii=False)

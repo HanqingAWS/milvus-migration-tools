@@ -3,9 +3,10 @@
 Milvus Data Export Tool
 =======================
 Export collection data (schema + index + data) from a Milvus instance to JSON files.
+Automatically detects primary key field and data types - no assumptions about data structure.
 
 Usage:
-    python3 export_data.py --host 10.0.1.100 --port 19530 --collection game_cs_knowledge --output ./milvus_export
+    python3 export_data.py --host 10.0.1.100 --port 19530 --collection my_collection --output ./milvus_export
 
 Output:
     <output_dir>/
@@ -38,7 +39,7 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def connect_milvus(host, port, user=None, password=None, db_name="default"):
+def connect_milvus(host, port, user=None, password=None):
     """Connect to a Milvus instance."""
     kwargs = {"host": host, "port": port}
     if user and password:
@@ -46,6 +47,14 @@ def connect_milvus(host, port, user=None, password=None, db_name="default"):
         kwargs["password"] = password
     connections.connect("default", **kwargs)
     print(f"Connected to Milvus at {host}:{port}")
+
+
+def find_primary_field(collection):
+    """Auto-detect primary key field from collection schema."""
+    for f in collection.schema.fields:
+        if f.is_primary:
+            return f.name, str(f.dtype)
+    return None, None
 
 
 def export_schema(collection):
@@ -84,31 +93,52 @@ def export_index(collection):
     return index_info
 
 
-def export_data(collection, batch_size=500):
-    """Export all data from a collection."""
+def clean_row(row):
+    """Convert numpy types in a row to native Python types for JSON serialization."""
+    cleaned = {}
+    for k, v in row.items():
+        if isinstance(v, np.ndarray):
+            cleaned[k] = v.tolist()
+        elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], (np.float32, np.float64)):
+            cleaned[k] = [float(x) for x in v]
+        elif isinstance(v, (np.float32, np.float64)):
+            cleaned[k] = float(v)
+        elif isinstance(v, (np.int32, np.int64)):
+            cleaned[k] = int(v)
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+def export_data_by_pk_iteration(collection, pk_name, pk_dtype, batch_size=500):
+    """
+    Export all data using primary key based iteration.
+    Works with any PK type (INT64, VARCHAR) and any PK values (non-sequential, UUIDs, etc).
+    Uses offset/limit pagination with a universal filter expression.
+    """
     output_fields = [f.name for f in collection.schema.fields]
     total = collection.num_entities
     all_data = []
 
+    # Use a universal expression that matches all records
+    # For INT64 PK: "pk_field >= -9223372036854775808" (INT64 min)
+    # For VARCHAR PK: "pk_field != ''" covers non-empty, but we use pk_field > "" for all
+    if "INT" in pk_dtype:
+        match_all_expr = f'{pk_name} >= -9223372036854775808'
+    else:
+        # VARCHAR PK - use >= "" to match everything
+        match_all_expr = f'{pk_name} != "__IMPOSSIBLE_VALUE_PLACEHOLDER__"'
+
     for offset in range(0, total, batch_size):
         results = collection.query(
-            expr="id >= 0",
+            expr=match_all_expr,
             output_fields=output_fields,
             offset=offset,
             limit=batch_size,
         )
         for row in results:
-            cleaned = {}
-            for k, v in row.items():
-                if isinstance(v, (list, np.ndarray)):
-                    cleaned[k] = [float(x) for x in v]
-                elif isinstance(v, (np.float32, np.float64)):
-                    cleaned[k] = float(v)
-                elif isinstance(v, (np.int32, np.int64)):
-                    cleaned[k] = int(v)
-                else:
-                    cleaned[k] = v
-            all_data.append(cleaned)
+            all_data.append(clean_row(row))
+
         exported = min(offset + batch_size, total)
         print(f"  Exported {exported}/{total} records ({exported * 100 // total}%)")
 
@@ -143,7 +173,15 @@ def main():
 
     collection = Collection(args.collection)
     collection.load()
+
+    # Auto-detect primary key
+    pk_name, pk_dtype = find_primary_field(collection)
+    if not pk_name:
+        print("Error: No primary key field found in collection schema.")
+        sys.exit(1)
+
     print(f"Collection: {args.collection} ({collection.num_entities} entities)")
+    print(f"Primary key: {pk_name} ({pk_dtype})")
 
     # Create output dir
     os.makedirs(args.output, exist_ok=True)
@@ -165,7 +203,7 @@ def main():
     # 3. Export data
     print(f"\n[3/3] Exporting data ({collection.num_entities} records)...")
     export_start = time.time()
-    all_data = export_data(collection, batch_size=args.batch_size)
+    all_data = export_data_by_pk_iteration(collection, pk_name, pk_dtype, batch_size=args.batch_size)
     export_time = time.time() - export_start
 
     data_path = os.path.join(args.output, "data.json")
@@ -181,8 +219,10 @@ def main():
         "data_file_size_bytes": data_size,
         "source_host": args.host,
         "source_port": args.port,
+        "primary_key_field": pk_name,
+        "primary_key_type": pk_dtype,
         "export_timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "tool_version": "1.0.0",
+        "tool_version": "1.1.0",
     }
     with open(os.path.join(args.output, "export_meta.json"), "w", encoding="utf-8") as f:
         json.dump(export_meta, f, indent=2)
