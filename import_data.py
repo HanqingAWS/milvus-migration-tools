@@ -157,6 +157,42 @@ def create_indexes(collection, index_info):
         print(f"  Index created on '{idx['field_name']}': {index_params['index_type']} / {index_params['metric_type']}")
 
 
+def import_one_collection(input_dir, batch_size=200, drop_existing=False):
+    """Import a single collection from an export directory. Returns metadata dict."""
+    schema_info, index_info, all_data = load_export_files(input_dir)
+    collection_name = schema_info["collection_name"]
+
+    print(f"\n  Importing '{collection_name}' ({len(all_data)} records)...")
+
+    collection = create_collection(schema_info, drop_existing=drop_existing)
+
+    import_start = time.time()
+    total_inserted = insert_data(collection, schema_info, all_data, batch_size=batch_size)
+    import_time = time.time() - import_start
+    print(f"  Flush completed. Total entities: {collection.num_entities}")
+
+    index_start = time.time()
+    create_indexes(collection, index_info)
+    index_time = time.time() - index_start
+
+    collection.load()
+    print(f"  Collection loaded and ready for queries")
+
+    import_meta = {
+        "collection_name": collection_name,
+        "total_records": total_inserted,
+        "import_time_seconds": round(import_time, 2),
+        "index_time_seconds": round(index_time, 2),
+        "import_timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        "tool_version": "1.2.0",
+    }
+    meta_path = os.path.join(input_dir, "import_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(import_meta, f, indent=2)
+
+    return import_meta
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Import Milvus collection data from JSON files"
@@ -165,9 +201,10 @@ def main():
     parser.add_argument("--port", default="19530", help="Milvus port (default: 19530)")
     parser.add_argument("--user", default=None, help="Milvus username (if auth enabled)")
     parser.add_argument("--password", default=None, help="Milvus password (if auth enabled)")
-    parser.add_argument("--input", required=True, help="Input directory containing exported JSON files")
+    parser.add_argument("--input", required=True, help="Input directory (single collection or parent of --all export)")
     parser.add_argument("--batch-size", type=int, default=200, help="Insert batch size (default: 200)")
     parser.add_argument("--drop-existing", action="store_true", help="Drop existing collection before importing")
+    parser.add_argument("--all", action="store_true", help="Import all collections from subdirectories (used with --all export)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -177,53 +214,50 @@ def main():
     # Connect
     connect_milvus(args.host, args.port, args.user, args.password)
 
-    # Load files
-    print("\n[1/4] Loading export files...")
-    schema_info, index_info, all_data = load_export_files(args.input)
+    # --all mode: import every subdirectory that contains schema.json
+    if args.all:
+        subdirs = []
+        for name in sorted(os.listdir(args.input)):
+            subdir = os.path.join(args.input, name)
+            if os.path.isdir(subdir) and os.path.exists(os.path.join(subdir, "schema.json")):
+                subdirs.append(subdir)
 
-    # Create collection
-    print("\n[2/4] Creating collection...")
-    collection = create_collection(schema_info, drop_existing=args.drop_existing)
+        if not subdirs:
+            print(f"\nNo collection export directories found in {args.input}")
+            print("  (Expected subdirectories with schema.json files)")
+            connections.disconnect("default")
+            sys.exit(1)
 
-    # Insert data
-    print(f"\n[3/4] Importing data ({len(all_data)} records)...")
-    import_start = time.time()
-    total_inserted = insert_data(collection, schema_info, all_data, batch_size=args.batch_size)
-    import_time = time.time() - import_start
-    print(f"  Flush completed. Total entities: {collection.num_entities}")
+        print(f"\nFound {len(subdirs)} collection(s) to import:")
+        for d in subdirs:
+            print(f"  - {os.path.basename(d)}/")
 
-    # Create indexes
-    print("\n[4/4] Creating indexes...")
-    index_start = time.time()
-    create_indexes(collection, index_info)
-    index_time = time.time() - index_start
+        total_start = time.time()
+        results = []
+        for subdir in subdirs:
+            meta = import_one_collection(subdir, batch_size=args.batch_size, drop_existing=args.drop_existing)
+            results.append(meta)
 
-    # Load collection
-    collection.load()
-    print(f"  Collection loaded and ready for queries")
+        total_time = time.time() - total_start
+        print(f"\n{'=' * 60}")
+        print(f"All imports completed!")
+        print(f"  Collections: {len(results)}")
+        print(f"  Total records: {sum(m['total_records'] for m in results)}")
+        print(f"  Total time: {total_time:.2f}s")
+        print(f"{'=' * 60}")
 
-    # Save import metadata
-    import_meta = {
-        "collection_name": schema_info["collection_name"],
-        "total_records": total_inserted,
-        "import_time_seconds": round(import_time, 2),
-        "index_time_seconds": round(index_time, 2),
-        "target_host": args.host,
-        "target_port": args.port,
-        "import_timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "tool_version": "1.0.0",
-    }
-    meta_path = os.path.join(args.input, "import_meta.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(import_meta, f, indent=2)
+        connections.disconnect("default")
+        return
 
-    # Summary
+    # Single collection mode
+    meta = import_one_collection(args.input, batch_size=args.batch_size, drop_existing=args.drop_existing)
+
     print(f"\n{'=' * 60}")
     print(f"Import completed successfully!")
-    print(f"  Records:    {total_inserted}")
-    print(f"  Import:     {import_time:.2f}s")
-    print(f"  Indexing:   {index_time:.2f}s")
-    print(f"  Collection: {schema_info['collection_name']}")
+    print(f"  Collection: {meta['collection_name']}")
+    print(f"  Records:    {meta['total_records']}")
+    print(f"  Import:     {meta['import_time_seconds']}s")
+    print(f"  Indexing:   {meta['index_time_seconds']}s")
     print(f"{'=' * 60}")
 
     connections.disconnect("default")

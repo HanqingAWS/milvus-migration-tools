@@ -9,6 +9,9 @@
 - **数据导出** (`export_data.py`)：将 Collection 的 Schema、索引配置、全量数据导出为 JSON 文件
 - **数据导入** (`import_data.py`)：从 JSON 文件中读取数据，在目标 Milvus 实例上重建 Collection 并导入
 - **迁移验证** (`verify_migration.py`)：对比源和目标实例的数据一致性（条数、Schema、抽样、搜索结果）
+- **自动发现**：`--list` 列出所有 Collections 及详细信息，无需提前知道数据结构
+- **批量操作**：`--all` 一次性导出/导入实例上的所有 Collections
+- **通用适配**：自动检测主键字段名和类型，支持 INT64 / VARCHAR / UUID 等任意主键
 
 ## 适用场景
 
@@ -30,7 +33,29 @@
 pip install -r requirements.txt
 ```
 
-### 2. 从源 Milvus 导出数据
+### 2. 查看有哪些 Collections（不知道数据结构时先用这个）
+
+```bash
+python3 export_data.py --host 10.0.1.100 --port 19530 --list
+```
+
+输出示例：
+
+```
+Collections on this instance:
+
+  Found 3 collection(s):
+
+  Collection Name                  Entities  PK Field          Vector Field     Dim
+  ------------------------------ ----------  ---------------- ---------------- -----
+  game_cs_knowledge                    1000  id(INT64)        embedding          768
+  product_catalog                     50000  sku(VARCHAR)     feature_vec        512
+  user_queries                        12345  query_id(INT64)  query_embedding   1536
+```
+
+### 3. 导出数据
+
+**导出单个 Collection：**
 
 ```bash
 python3 export_data.py \
@@ -40,23 +65,59 @@ python3 export_data.py \
     --output ./milvus_export
 ```
 
+**一次性导出所有 Collections：**
+
+```bash
+python3 export_data.py \
+    --host 10.0.1.100 \
+    --port 19530 \
+    --all \
+    --output ./milvus_export
+```
+
 导出产物：
 
 ```
+# 单个 Collection
 milvus_export/
 ├── schema.json        # Collection Schema 定义
 ├── index.json         # 索引配置（类型、参数）
 ├── data.json          # 全量数据（含向量和标量字段）
 └── export_meta.json   # 导出元数据（时间戳、记录数等）
+
+# --all 模式（每个 Collection 一个子目录）
+milvus_export/
+├── game_cs_knowledge/
+│   ├── schema.json
+│   ├── index.json
+│   ├── data.json
+│   └── export_meta.json
+├── product_catalog/
+│   └── ...
+└── user_queries/
+    └── ...
 ```
 
-### 3. 导入到目标 Milvus
+### 4. 导入到目标 Milvus
+
+**导入单个 Collection：**
 
 ```bash
 python3 import_data.py \
     --host 10.0.2.200 \
     --port 19530 \
     --input ./milvus_export \
+    --drop-existing
+```
+
+**批量导入所有 Collections（配合 `--all` 导出使用）：**
+
+```bash
+python3 import_data.py \
+    --host 10.0.2.200 \
+    --port 19530 \
+    --input ./milvus_export \
+    --all \
     --drop-existing
 ```
 
@@ -86,18 +147,21 @@ python3 verify_migration.py \
 ### export_data.py
 
 ```
-usage: export_data.py [-h] --collection COLLECTION [--host HOST] [--port PORT]
+usage: export_data.py [-h] [--host HOST] [--port PORT]
                       [--user USER] [--password PASSWORD]
-                      [--output OUTPUT] [--batch-size BATCH_SIZE]
+                      [--collection COLLECTION] [--output OUTPUT]
+                      [--batch-size BATCH_SIZE] [--list] [--all]
 
 参数说明：
   --host            Milvus 地址（默认: localhost）
   --port            Milvus 端口（默认: 19530）
   --user            用户名（开启认证时使用）
   --password        密码（开启认证时使用）
-  --collection      要导出的 Collection 名称（必填）
+  --collection      要导出的 Collection 名称
   --output          导出目录（默认: ./milvus_export）
   --batch-size      查询批次大小（默认: 500）
+  --list            列出所有 Collections 及详细信息，然后退出
+  --all             导出实例上的所有 Collections
 ```
 
 ### import_data.py
@@ -105,7 +169,7 @@ usage: export_data.py [-h] --collection COLLECTION [--host HOST] [--port PORT]
 ```
 usage: import_data.py [-h] --input INPUT [--host HOST] [--port PORT]
                       [--user USER] [--password PASSWORD]
-                      [--batch-size BATCH_SIZE] [--drop-existing]
+                      [--batch-size BATCH_SIZE] [--drop-existing] [--all]
 
 参数说明：
   --host            Milvus 地址（默认: localhost）
@@ -115,6 +179,7 @@ usage: import_data.py [-h] --input INPUT [--host HOST] [--port PORT]
   --input           导出文件所在目录（必填）
   --batch-size      插入批次大小（默认: 200）
   --drop-existing   如果目标已存在同名 Collection，先删除再导入
+  --all             导入目录下所有 Collection 子目录（配合 export --all 使用）
 ```
 
 ### verify_migration.py
@@ -143,39 +208,42 @@ usage: verify_migration.py [-h] --source-host SOURCE_HOST --target-host TARGET_H
 以下示例演示将游戏客服知识库从旧主机 `10.0.1.100` 迁移到新主机 `10.0.2.200`：
 
 ```bash
-# Step 1: 在新主机上部署 Milvus（Docker Compose 方式）
+# Step 1: 安装工具
+git clone https://github.com/HanqingAWS/milvus-migration-tools.git
+cd milvus-migration-tools
+pip install -r requirements.txt
+
+# Step 2: 先看看旧 Milvus 上有哪些 Collections
+python3 export_data.py --host 10.0.1.100 --list
+
+# Step 3: 在新主机上部署 Milvus
 ssh user@10.0.2.200
 mkdir -p ~/milvus && cd ~/milvus
 wget https://github.com/milvus-io/milvus/releases/download/v2.4.17/milvus-standalone-docker-compose.yml -O docker-compose.yml
 sudo docker compose up -d
 
-# Step 2: 在可以访问两台主机的机器上安装工具
-git clone https://github.com/HanqingAWS/milvus-migration-tools.git
-cd milvus-migration-tools
-pip install -r requirements.txt
+# Step 4: 导出（二选一）
+# 方式 A: 导出单个 Collection
+python3 export_data.py --host 10.0.1.100 --collection game_cs_knowledge --output ./milvus_export
 
-# Step 3: 从旧主机导出
-python3 export_data.py \
-    --host 10.0.1.100 \
-    --port 19530 \
-    --collection game_cs_knowledge \
-    --output ./milvus_export
+# 方式 B: 一次性导出所有 Collections
+python3 export_data.py --host 10.0.1.100 --all --output ./milvus_export
 
-# Step 4: 导入到新主机
-python3 import_data.py \
-    --host 10.0.2.200 \
-    --port 19530 \
-    --input ./milvus_export \
-    --drop-existing
+# Step 5: 导入到新主机（对应上面的方式）
+# 方式 A: 导入单个
+python3 import_data.py --host 10.0.2.200 --input ./milvus_export --drop-existing
 
-# Step 5: 验证
+# 方式 B: 批量导入所有
+python3 import_data.py --host 10.0.2.200 --input ./milvus_export --all --drop-existing
+
+# Step 6: 验证
 python3 verify_migration.py \
     --source-host 10.0.1.100 \
     --target-host 10.0.2.200 \
     --collection game_cs_knowledge \
     --output verify_results.json
 
-# Step 6: 更新应用配置（仅需修改连接地址）
+# Step 7: 更新应用配置（仅需修改连接地址）
 # 将应用中的 MILVUS_HOST 从 10.0.1.100 改为 10.0.2.200
 # 重启应用服务即可，无需修改任何业务代码
 ```
