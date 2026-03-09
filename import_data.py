@@ -29,8 +29,10 @@ from pymilvus import (
     utility,
 )
 
-# Mapping from string dtype to pymilvus DataType
+# Mapping from string/int dtype to pymilvus DataType
+# Supports both string format ("DataType.INT64") and numeric format (5)
 DTYPE_MAP = {
+    # String format (from str(field.dtype))
     "DataType.BOOL": DataType.BOOL,
     "DataType.INT8": DataType.INT8,
     "DataType.INT16": DataType.INT16,
@@ -42,6 +44,30 @@ DTYPE_MAP = {
     "DataType.JSON": DataType.JSON,
     "DataType.FLOAT_VECTOR": DataType.FLOAT_VECTOR,
     "DataType.BINARY_VECTOR": DataType.BINARY_VECTOR,
+    # Numeric format (from DataType.value or old exports)
+    1: DataType.BOOL,
+    2: DataType.INT8,
+    3: DataType.INT16,
+    4: DataType.INT32,
+    5: DataType.INT64,
+    10: DataType.FLOAT,
+    11: DataType.DOUBLE,
+    21: DataType.VARCHAR,
+    23: DataType.JSON,
+    100: DataType.BINARY_VECTOR,
+    101: DataType.FLOAT_VECTOR,
+    # String-numeric format (from some export tools: "5", "21", etc.)
+    "1": DataType.BOOL,
+    "2": DataType.INT8,
+    "3": DataType.INT16,
+    "4": DataType.INT32,
+    "5": DataType.INT64,
+    "10": DataType.FLOAT,
+    "11": DataType.DOUBLE,
+    "21": DataType.VARCHAR,
+    "23": DataType.JSON,
+    "100": DataType.BINARY_VECTOR,
+    "101": DataType.FLOAT_VECTOR,
 }
 
 
